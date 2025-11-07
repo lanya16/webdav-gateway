@@ -1,0 +1,298 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: webdav-postgres-prod
+    environment:
+      POSTGRES_USER: webdav
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: webdav_gateway
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - ./init-locks.sql:/docker-entrypoint-initdb.d/init-locks.sql
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webdav"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - webdav-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  redis:
+    image: redis:7-alpine
+    container_name: webdav-redis-prod
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - webdav-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+  minio:
+    image: minio/minio:latest
+    container_name: webdav-minio-prod
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - webdav-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  webdav-gateway:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    container_name: webdav-gateway-prod
+    environment:
+      # 基础配置
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8080
+      GIN_MODE: release
+      
+      # 数据库配置
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: webdav
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: webdav_gateway
+      DB_SSLMODE: require
+      DB_MAX_CONNECTIONS: 50
+      DB_MAX_IDLE_CONNECTIONS: 10
+      
+      # Redis配置
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB: 0
+      REDIS_POOL_SIZE: 20
+      
+      # MinIO配置
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_USE_SSL: true
+      MINIO_BUCKET_PREFIX: webdav-prod-
+      
+      # 认证配置
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRATION_HOURS: 12
+      JWT_REFRESH_DAYS: 7
+      
+      # 存储配置
+      DEFAULT_STORAGE_QUOTA: ${DEFAULT_STORAGE_QUOTA}
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE}
+      
+      # 分享配置
+      SHARE_BASE_URL: ${SHARE_BASE_URL}
+      DEFAULT_SHARE_EXPIRATION_HOURS: 168
+      
+      # 🔒 生产环境锁定配置
+      ENABLE_LOCKING: true
+      LOCK_TIMEOUT_DEFAULT: 1800              # 生产环境建议30分钟
+      LOCK_TIMEOUT_MAX: 7200                  # 最大2小时
+      LOCK_PERSISTENCE_ENABLED: true          # 启用持久化
+      LOCK_PERSISTENCE_DRIVER: postgres       # 使用PostgreSQL持久化
+      LOCK_CLEANUP_INTERVAL: 180              # 每3分钟清理
+      LOCK_MEMORY_LIMIT: 128                  # 增加内存限制
+      LOCK_CHECK_TIMEOUT: 3000                # 减少检查超时
+      LOCK_CONFLICT_RETRY_COUNT: 5            # 增加重试次数
+      LOCK_CONFLICT_RETRY_DELAY: 50           # 减少重试延迟
+      LOCK_LOG_LEVEL: warn                    # 生产环境使用warn级别
+      LOCK_METRICS_ENABLED: true
+      LOCK_HEALTH_CHECK_ENABLED: true
+      LOCK_TABLE_NAME: webdav_locks
+      LOCK_INDEX_NAME: idx_webdav_locks_path
+      LOCK_CLEANUP_BATCH_SIZE: 1000
+      
+      # 日志和安全配置
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      LOG_OUTPUT: file
+      LOG_FILE_PATH: /var/log/webdav-gateway/app.log
+      LOG_MAX_SIZE: 500
+      LOG_MAX_BACKUPS: 30
+      LOG_MAX_AGE: 90
+      ENABLE_CORS: true
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS}
+      TRUSTED_PROXIES: 127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      
+      # 监控配置
+      HEALTH_CHECK_ENABLED: true
+      HEALTH_CHECK_INTERVAL: 30
+      METRICS_ENABLED: true
+      METRICS_ENDPOINT: /metrics
+      PROFILING_ENABLED: false
+      
+      # 性能配置
+      DB_CONNECTION_TIMEOUT: 30
+      DB_QUERY_TIMEOUT: 30
+      CACHE_TTL: 3600
+      CACHE_MAX_SIZE: 1000
+      
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./logs:/var/log/webdav-gateway
+      - ./backups:/opt/backups
+      - locks_data:/var/lib/webdav/locks
+    networks:
+      - webdav-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+
+  # 锁定清理服务
+  lock-cleanup:
+    image: postgres:15-alpine
+    container_name: webdav-lock-cleanup
+    environment:
+      PGPASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./scripts/cleanup-locks.sh:/cleanup-locks.sh
+    command: /bin/sh -c "
+      while true; do
+        echo '开始锁定清理任务...'
+        /cleanup-locks.sh
+        echo '等待下次清理...'
+        sleep 300  # 每5分钟执行一次
+      done
+    "
+    depends_on:
+      - postgres
+    networks:
+      - webdav-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # 监控服务（可选）
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: webdav-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks:
+      - webdav-network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: webdav-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - webdav-network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  locks_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  webdav-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
