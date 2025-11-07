@@ -1,0 +1,155 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: webdav-postgres
+    environment:
+      POSTGRES_USER: webdav
+      POSTGRES_PASSWORD: webdav_password
+      POSTGRES_DB: webdav_gateway
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webdav"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - webdav-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: webdav-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - webdav-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: webdav-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - webdav-network
+
+  webdav-gateway:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    container_name: webdav-gateway
+    environment:
+      # 基础配置
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8080
+      GIN_MODE: release
+      
+      # 数据库配置
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: webdav
+      DB_PASSWORD: webdav_password
+      DB_NAME: webdav_gateway
+      DB_SSLMODE: disable
+      
+      # Redis配置
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: 0
+      
+      # MinIO配置
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_USE_SSL: false
+      MINIO_BUCKET_PREFIX: webdav-
+      
+      # 认证配置
+      JWT_SECRET: your-secret-key-change-in-production
+      JWT_EXPIRATION_HOURS: 24
+      
+      # 存储配置
+      DEFAULT_STORAGE_QUOTA: 10737418240
+      MAX_FILE_SIZE: 5368709120
+      
+      # 分享配置
+      SHARE_BASE_URL: http://localhost:8080/share
+      DEFAULT_SHARE_EXPIRATION_HOURS: 168
+      
+      # 🔒 锁定功能配置
+      ENABLE_LOCKING: true                    # 启用锁定功能
+      LOCK_TIMEOUT_DEFAULT: 3600              # 默认锁定超时（秒）
+      LOCK_TIMEOUT_MAX: 86400                 # 最大锁定超时（秒）
+      LOCK_PERSISTENCE_ENABLED: false         # 启用持久化（开发环境false）
+      LOCK_PERSISTENCE_DRIVER: memory         # 持久化驱动：memory/postgres/redis
+      LOCK_CLEANUP_INTERVAL: 300              # 清理间隔（秒）
+      LOCK_MEMORY_LIMIT: 64                   # 内存限制（MB）
+      LOCK_CHECK_TIMEOUT: 5000                # 检查超时（毫秒）
+      LOCK_CONFLICT_RETRY_COUNT: 3            # 冲突重试次数
+      LOCK_CONFLICT_RETRY_DELAY: 100          # 冲突重试延迟（毫秒）
+      LOCK_LOG_LEVEL: info                    # 锁定日志级别
+      LOCK_METRICS_ENABLED: true              # 启用锁定指标
+      LOCK_HEALTH_CHECK_ENABLED: true         # 启用锁定健康检查
+      
+      # 日志和安全配置
+      LOG_LEVEL: info
+      ENABLE_CORS: true
+      TRUSTED_PROXIES: 127.0.0.1
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./logs:/var/log/webdav-gateway        # 日志目录
+      - locks_data:/var/lib/webdav/locks     # 锁定数据目录
+    networks:
+      - webdav-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  locks_data:                                # 锁定数据卷
+
+networks:
+  webdav-network:
+    driver: bridge
